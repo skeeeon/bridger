@@ -25,15 +25,19 @@
         {
             "source": "devices/#",
             "destination": "forwarded/devices/#"
-        },
-        {
-            "source": "building/+/floor/+/room/+/sensor",
-            "destination": "processed/+/+/+/data"
         }
     ],
     "log": {
         "level": "info",
         "encoding": "json",
         "output_path": "bridge.log"
+    },
+    "metrics": {
+        "enabled": true,
+        "address": ":8080",
+        "path": "/metrics",
+        "basic_auth": true,
+        "username": "metrics",
+        "password": "secret"
     }
 }
