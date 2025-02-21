@@ -1,0 +1,39 @@
+{
+    "source": {
+        "broker": "tcp://source-broker:1883",
+        "client_id": "mqtt-bridge-source",
+        "username": "source_user",
+        "password": "source_pass",
+        "tls": {
+            "enable": false
+        }
+    },
+    "destination": {
+        "broker": "tcp://dest-broker:1883",
+        "client_id": "mqtt-bridge-dest",
+        "username": "dest_user",
+        "password": "dest_pass",
+        "tls": {
+            "enable": false
+        }
+    },
+    "topic_map": [
+        {
+            "source": "sensors/+/temperature",
+            "destination": "forwarded/+/temp"
+        },
+        {
+            "source": "devices/#",
+            "destination": "forwarded/devices/#"
+        },
+        {
+            "source": "building/+/floor/+/room/+/sensor",
+            "destination": "processed/+/+/+/data"
+        }
+    ],
+    "log": {
+        "level": "info",
+        "encoding": "json",
+        "output_path": "bridge.log"
+    }
+}
