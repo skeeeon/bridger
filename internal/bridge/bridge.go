@@ -5,11 +5,14 @@ import (
     "fmt"
     "sync"
     "time"
+    "runtime"
 
     "bridger/internal/config"
     "bridger/internal/logger"
     "bridger/internal/metrics"
+
     mqtt "github.com/eclipse/paho.mqtt.golang"
+    "github.com/sony/gobreaker"
 )
 
 // Bridge handles message forwarding between source and destination brokers
@@ -20,6 +23,8 @@ type Bridge struct {
     sourceConn    mqtt.Client
     destConn      mqtt.Client
     topicMapper   []*TopicMatcher
+    workerPool    *WorkerPool
+    breaker       *gobreaker.CircuitBreaker
     isConnected   struct {
         source bool
         dest   bool
@@ -53,6 +58,46 @@ func NewBridge(cfg *config.Config, log *logger.Logger, metrics *metrics.Metrics,
         mapper := NewTopicMatcher(tm.Source, tm.Destination)
         bridge.topicMapper = append(bridge.topicMapper, mapper)
     }
+
+    // Create worker config
+    workerCfg := NewWorkerConfigFromConfig(
+        cfg.Performance.WorkerPool.NumWorkers,
+        cfg.Performance.WorkerPool.BatchSize,
+        cfg.Performance.WorkerPool.BatchTimeoutMs,
+        cfg.Performance.WorkerPool.QueueSize,
+    )
+
+    // If NumWorkers not specified, use CPU count
+    if workerCfg.NumWorkers <= 0 {
+        workerCfg.NumWorkers = runtime.NumCPU()
+    }
+
+    // Initialize circuit breaker
+    breakerCfg := NewBreakerConfig(
+        "mqtt-publisher",
+        cfg.Performance.CircuitBreaker.MaxFailures,
+        cfg.Performance.CircuitBreaker.TimeoutSeconds,
+        cfg.Performance.CircuitBreaker.MaxRequests,
+        cfg.Performance.CircuitBreaker.IntervalSeconds,
+    )
+    
+    bridge.breaker = NewCircuitBreaker(breakerCfg, log, metrics)
+
+    // Create publisher function for worker pool
+    publisher := func(topic string, payload []byte) error {
+        token := bridge.destConn.Publish(topic, 0, false, payload)
+        token.Wait()
+        return token.Error()
+    }
+
+    // Initialize worker pool
+    bridge.workerPool = NewWorkerPool(
+        workerCfg,
+        metrics,
+        log.With("component", "worker_pool"),
+        bridge.breaker,
+        publisher,
+    )
 
     // Initialize source connection
     sourceOpts := mqtt.NewClientOptions().
@@ -123,15 +168,21 @@ func (b *Bridge) Start() error {
         return fmt.Errorf("failed to connect to destination broker: %w", token.Error())
     }
 
+    // Start worker pool
+    b.workerPool.Start()
+
     b.logger.Info("bridge started successfully",
         "mappings", len(b.topicMapper),
+        "workers", b.workerPool.config.NumWorkers,
+        "batchSize", b.workerPool.config.BatchSize,
+        "batchTimeout", b.workerPool.config.BatchTimeout,
+        "queueSize", b.workerPool.config.QueueSize,
         "version", b.buildVersion,
         "commit", b.buildCommit)
 
     return nil
 }
 
-// collectSystemMetrics periodically updates system metrics
 func (b *Bridge) collectSystemMetrics() {
     ticker := time.NewTicker(15 * time.Second)
     defer ticker.Stop()
@@ -146,7 +197,6 @@ func (b *Bridge) collectSystemMetrics() {
     }
 }
 
-// handleSourceConnected handles successful source broker connections
 func (b *Bridge) handleSourceConnected(_ mqtt.Client) {
     b.logger.Info("connected to source broker", "broker", b.cfg.Source.Broker)
     
@@ -156,7 +206,6 @@ func (b *Bridge) handleSourceConnected(_ mqtt.Client) {
 
     b.metrics.SetConnectionStatus(true, true)
 
-    // Subscribe to all topics
     if err := b.subscribeToTopics(); err != nil {
         b.logger.Error("failed to subscribe to topics after connection",
             "error", err)
@@ -165,7 +214,6 @@ func (b *Bridge) handleSourceConnected(_ mqtt.Client) {
     }
 }
 
-// handleDestConnected handles successful destination broker connections
 func (b *Bridge) handleDestConnected(_ mqtt.Client) {
     b.logger.Info("connected to destination broker", "broker", b.cfg.Destination.Broker)
     
@@ -176,7 +224,6 @@ func (b *Bridge) handleDestConnected(_ mqtt.Client) {
     b.metrics.SetConnectionStatus(false, true)
 }
 
-// handleSourceConnectionLost handles source broker connection loss
 func (b *Bridge) handleSourceConnectionLost(_ mqtt.Client, err error) {
     b.logger.Error("lost connection to source broker",
         "error", err,
@@ -190,7 +237,6 @@ func (b *Bridge) handleSourceConnectionLost(_ mqtt.Client, err error) {
     b.metrics.RecordReconnect(true)
 }
 
-// handleDestConnectionLost handles destination broker connection loss
 func (b *Bridge) handleDestConnectionLost(_ mqtt.Client, err error) {
     b.logger.Error("lost connection to destination broker",
         "error", err,
@@ -204,10 +250,8 @@ func (b *Bridge) handleDestConnectionLost(_ mqtt.Client, err error) {
     b.metrics.RecordReconnect(false)
 }
 
-// subscribeToTopics subscribes to all configured source topics
 func (b *Bridge) subscribeToTopics() error {
     for _, mapper := range b.topicMapper {
-        // Create closure to capture mapper
         handler := func(mapper *TopicMatcher) mqtt.MessageHandler {
             return func(client mqtt.Client, msg mqtt.Message) {
                 b.handleMessage(msg.Topic(), msg.Payload(), mapper)
@@ -229,61 +273,34 @@ func (b *Bridge) subscribeToTopics() error {
     return nil
 }
 
-// handleMessage processes and forwards messages
 func (b *Bridge) handleMessage(sourceTopic string, payload []byte, mapper *TopicMatcher) {
-    start := time.Now()
-    payloadSize := len(payload)
-
-    // Check destination connection before attempting to publish
-    b.isConnected.RLock()
-    destConnected := b.isConnected.dest
-    b.isConnected.RUnlock()
-
-    if !destConnected {
-        b.logger.Error("cannot forward message - destination broker not connected",
-            "sourceTopic", sourceTopic)
-        b.metrics.RecordError()
-        return
+    msg := Message{
+        Topic:     sourceTopic,
+        Payload:   payload,
+        Mapper:    mapper,
+        Timestamp: time.Now(),
     }
 
-    // Generate destination topic
-    destTopic := mapper.Transform(sourceTopic)
-
-    b.logger.Debug("forwarding message",
-        "sourceTopic", sourceTopic,
-        "destTopic", destTopic,
-        "payloadSize", payloadSize)
-
-    // Publish to destination broker
-    if token := b.destConn.Publish(destTopic, 0, false, payload); token.Wait() && token.Error() != nil {
-        b.logger.Error("failed to forward message",
-            "error", token.Error(),
-            "sourceTopic", sourceTopic,
-            "destTopic", destTopic)
-        b.metrics.RecordError()
-        return
+    if !b.workerPool.Submit(msg) {
+        b.logger.Error("failed to submit message - queue full",
+            "topic", sourceTopic)
+        b.metrics.RecordMessageDropped()
     }
-
-    // Record metrics
-    processingTime := time.Since(start)
-    b.metrics.RecordMessage(payloadSize, payloadSize, processingTime)
-
-    b.logger.Debug("message forwarded successfully",
-        "sourceTopic", sourceTopic,
-        "destTopic", destTopic,
-        "processingTime", processingTime)
 }
 
-// IsConnected returns the connection status of both brokers
 func (b *Bridge) IsConnected() (source, dest bool) {
     b.isConnected.RLock()
     defer b.isConnected.RUnlock()
     return b.isConnected.source, b.isConnected.dest
 }
 
-// Stop gracefully shuts down the bridge
 func (b *Bridge) Stop() {
     b.logger.Info("stopping bridge")
+    
+    // Stop worker pool first to process remaining messages
+    b.workerPool.Stop()
+
+    // Cancel context for metric collection
     b.cancel()
 
     // Disconnect from brokers with a timeout

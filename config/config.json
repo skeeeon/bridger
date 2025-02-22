@@ -1,26 +1,26 @@
 {
     "source": {
-        "broker": "tcp://source-broker:1883",
+        "broker": "tcp://haos.int.stone-age.io:1883",
         "client_id": "mqtt-bridge-source",
-        "username": "source_user",
-        "password": "source_pass",
+        "username": "ezra",
+        "password": "ezra",
         "tls": {
             "enable": false
         }
     },
     "destination": {
-        "broker": "tcp://dest-broker:1883",
+        "broker": "tcp://mq.mono.816tech.com:1883",
         "client_id": "mqtt-bridge-dest",
-        "username": "dest_user",
-        "password": "dest_pass",
+        "username": "ezra",
+        "password": "ezra",
         "tls": {
             "enable": false
         }
     },
     "topic_map": [
         {
-            "source": "sensors/+/temperature",
-            "destination": "forwarded/+/temp"
+            "source": "espresense/#",
+            "destination": "forwarded/espresense/#"
         },
         {
             "source": "devices/#",
@@ -34,9 +34,9 @@
     },
     "metrics": {
         "enabled": true,
-        "address": ":8080",
+        "address": ":8187",
         "path": "/metrics",
-        "basic_auth": true,
+        "basic_auth": false,
         "username": "metrics",
         "password": "secret"
     }

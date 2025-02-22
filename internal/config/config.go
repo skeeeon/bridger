@@ -4,15 +4,39 @@ import (
     "encoding/json"
     "fmt"
     "os"
+    "time"
 )
 
 // Config holds the complete bridge configuration
 type Config struct {
-    Source      BrokerConfig  `json:"source"`
-    Destination BrokerConfig  `json:"destination"`
-    TopicMap    []TopicMap    `json:"topic_map"`
-    Log         LogConfig     `json:"log"`
-    Metrics     MetricsConfig `json:"metrics"`
+    Source      BrokerConfig   `json:"source"`
+    Destination BrokerConfig   `json:"destination"`
+    TopicMap    []TopicMap     `json:"topic_map"`
+    Performance PerformanceConfig `json:"performance"`
+    Log         LogConfig      `json:"log"`
+    Metrics     MetricsConfig  `json:"metrics"`
+}
+
+// PerformanceConfig holds all performance-related settings
+type PerformanceConfig struct {
+    WorkerPool     WorkerPoolConfig  `json:"worker_pool"`
+    CircuitBreaker BreakerConfig    `json:"circuit_breaker"`
+}
+
+// WorkerPoolConfig holds worker pool settings
+type WorkerPoolConfig struct {
+    NumWorkers     int `json:"num_workers"`
+    BatchSize      int `json:"batch_size"`
+    BatchTimeoutMs int `json:"batch_timeout_ms"`
+    QueueSize      int `json:"queue_size"`
+}
+
+// BreakerConfig holds circuit breaker settings
+type BreakerConfig struct {
+    MaxFailures     int `json:"max_failures"`
+    TimeoutSeconds  int `json:"timeout_seconds"`
+    MaxRequests     int `json:"max_requests"`
+    IntervalSeconds int `json:"interval_seconds"`
 }
 
 // MetricsConfig holds metrics server configuration
@@ -27,10 +51,10 @@ type MetricsConfig struct {
 
 // BrokerConfig holds MQTT broker connection settings
 type BrokerConfig struct {
-    Broker   string     `json:"broker"`
-    ClientID string     `json:"client_id"`
-    Username string     `json:"username"`
-    Password string     `json:"password"`
+    Broker   string    `json:"broker"`
+    ClientID string    `json:"client_id"`
+    Username string    `json:"username"`
+    Password string    `json:"password"`
     TLS      TLSConfig `json:"tls"`
 }
 
@@ -53,6 +77,22 @@ type LogConfig struct {
     Level      string `json:"level"`      // debug, info, warn, error
     Encoding   string `json:"encoding"`   // json or console
     OutputPath string `json:"output_path"` // file path or "stdout"
+}
+
+// Default configurations
+var DefaultPerformanceConfig = PerformanceConfig{
+    WorkerPool: WorkerPoolConfig{
+        NumWorkers:     8,
+        BatchSize:      100,
+        BatchTimeoutMs: 100,
+        QueueSize:      1000,
+    },
+    CircuitBreaker: BreakerConfig{
+        MaxFailures:     5,
+        TimeoutSeconds:  60,
+        MaxRequests:     2,
+        IntervalSeconds: 60,
+    },
 }
 
 // LoadConfig loads and validates the configuration from a file
@@ -89,6 +129,20 @@ func validateConfig(cfg *Config) error {
         return fmt.Errorf("at least one topic mapping is required")
     }
 
+    // Validate performance config
+    if cfg.Performance.WorkerPool.BatchSize < 1 {
+        return fmt.Errorf("batch size must be at least 1")
+    }
+    if cfg.Performance.WorkerPool.BatchTimeoutMs < 1 {
+        return fmt.Errorf("batch timeout must be at least 1ms")
+    }
+    if cfg.Performance.WorkerPool.QueueSize < 1 {
+        return fmt.Errorf("queue size must be at least 1")
+    }
+    if cfg.Performance.CircuitBreaker.MaxFailures < 1 {
+        return fmt.Errorf("circuit breaker max failures must be at least 1")
+    }
+
     // Validate metrics config
     if cfg.Metrics.Enabled {
         if cfg.Metrics.Address == "" {
@@ -107,21 +161,19 @@ func validateConfig(cfg *Config) error {
         return fmt.Errorf("invalid log encoding: %s", cfg.Log.Encoding)
     }
 
-    // Validate topic mappings
-    for i, tm := range cfg.TopicMap {
-        if tm.Source == "" {
-            return fmt.Errorf("source topic is required for mapping %d", i)
-        }
-        if tm.Destination == "" {
-            return fmt.Errorf("destination topic is required for mapping %d", i)
-        }
-    }
-
     return nil
 }
 
 // setDefaults sets default values for optional configuration
 func setDefaults(cfg *Config) {
+    // Performance defaults
+    if cfg.Performance.WorkerPool.NumWorkers == 0 {
+        cfg.Performance.WorkerPool = DefaultPerformanceConfig.WorkerPool
+    }
+    if cfg.Performance.CircuitBreaker.MaxFailures == 0 {
+        cfg.Performance.CircuitBreaker = DefaultPerformanceConfig.CircuitBreaker
+    }
+
     // Log defaults
     if cfg.Log.Level == "" {
         cfg.Log.Level = "info"
@@ -157,4 +209,20 @@ func isValidLogEncoding(encoding string) bool {
     default:
         return false
     }
+}
+
+// GetWorkerConfig converts the WorkerPoolConfig to bridge.WorkerConfig
+func (c *PerformanceConfig) GetWorkerConfig() WorkerPoolConfig {
+    return c.WorkerPool
+}
+
+// GetBreakerConfig converts the BreakerConfig to bridge.BreakerConfig
+func (c *PerformanceConfig) GetBreakerConfig() BreakerConfig {
+    return c.CircuitBreaker
+}
+
+// ToDuration converts time-based configurations to time.Duration
+func (c *BreakerConfig) ToDuration() (timeout, interval time.Duration) {
+    return time.Duration(c.TimeoutSeconds) * time.Second,
+           time.Duration(c.IntervalSeconds) * time.Second
 }

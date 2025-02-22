@@ -7,14 +7,17 @@ MQTT Bridge is a high-performance message forwarding service that connects two M
 - Forward messages between two MQTT brokers
 - Support for MQTT topic wildcards (`+` and `#`)
 - Flexible topic mapping and transformation
+- High-performance message processing:
+  - Parallel processing with configurable worker pool
+  - Message batching by topic
+  - Circuit breaker for failure protection
 - TLS/SSL support for secure connections
 - Automatic connection recovery
 - Topic resubscription on reconnection
 - Structured JSON logging
-- Prometheus metrics
+- Comprehensive Prometheus metrics
 - Health and status monitoring
 - Build version tracking
-- Docker support
 - Clean shutdown handling
 
 ## Installation
@@ -64,6 +67,20 @@ Configuration is provided via a JSON file. Here's an example:
             "destination": "forwarded/devices/#"
         }
     ],
+    "performance": {
+        "worker_pool": {
+            "num_workers": 8,         // Number of worker goroutines (defaults to CPU count if 0)
+            "batch_size": 100,        // Maximum messages per batch
+            "batch_timeout_ms": 100,  // Maximum time to wait before processing a partial batch
+            "queue_size": 1000        // Size of the message queue
+        },
+        "circuit_breaker": {
+            "max_failures": 5,         // Number of failures before opening
+            "timeout_seconds": 60,     // How long to wait before half-open
+            "max_requests": 2,         // Maximum requests in half-open state
+            "interval_seconds": 60     // Time window for failure counting
+        }
+    },
     "log": {
         "level": "info",
         "encoding": "json",
@@ -80,9 +97,28 @@ Configuration is provided via a JSON file. Here's an example:
 }
 ```
 
+## Performance Features
+
+### Worker Pool
+- Parallel message processing scaled to available CPU cores or configured count
+- Message queuing with configurable size for backpressure handling
+- Graceful shutdown with remaining message processing
+
+### Message Batching
+- Groups messages by destination topic
+- Configurable batch size and timeout
+- Reduces broker connection overhead
+- Optimized payload combining
+
+### Circuit Breaker
+- Protects against destination broker failures
+- Configurable failure thresholds and recovery periods
+- Three states: Closed (normal), Half-Open (testing), Open (failing)
+- Automatic state management based on failure rates
+
 ## Metrics and Monitoring
 
-The bridge provides comprehensive metrics and monitoring capabilities through several endpoints:
+The bridge provides comprehensive metrics through several endpoints:
 
 ### Prometheus Metrics
 
@@ -91,9 +127,16 @@ Available at `/metrics` (configurable path), includes:
 - **Message Metrics**
   - `bridge_messages_received_total`: Total messages received
   - `bridge_messages_forwarded_total`: Total messages forwarded
+  - `bridge_messages_dropped_total`: Messages dropped due to queue full
   - `bridge_bytes_received_total`: Total bytes received
   - `bridge_bytes_forwarded_total`: Total bytes forwarded
   - `bridge_processing_errors_total`: Total processing errors
+
+- **Batch Metrics**
+  - `bridge_batches_processed_total`: Total batches processed
+  - `bridge_batches_dropped_total`: Batches dropped due to queue full
+  - `bridge_batch_size`: Distribution of batch sizes
+  - `bridge_batch_latency_seconds`: Batch processing latency
 
 - **Connection Metrics**
   - `bridge_source_connected`: Source broker connection status (0/1)
@@ -114,7 +157,7 @@ curl -u metrics:secret http://localhost:8080/metrics
 
 ### Status Endpoint
 
-Available at `/status`, provides detailed operational status:
+Available at `/status`, provides operational status:
 
 ```bash
 curl http://localhost:8080/status
@@ -132,8 +175,12 @@ Response includes:
         "uptime_seconds": 3600,
         "messages_received": 1000,
         "messages_forwarded": 1000,
+        "messages_dropped": 0,
         "processing_errors": 0,
-        "average_latency_us": 1234
+        "average_latency_us": 1234,
+        "batches_processed": 100,
+        "batches_dropped": 0,
+        "breaker_trips": 0
     },
     "system": {
         "goroutines": 10,
@@ -166,22 +213,7 @@ HTTP Status Codes:
 - 200: Both brokers connected
 - 503: One or both brokers disconnected
 
-## Usage
-
-1. Create your configuration file:
-```bash
-cp config/config.example.json config/config.json
-# Edit config.json with your broker details
-```
-
-2. Run the bridge:
-```bash
-./mqtt-bridge -config config/config.json
-```
-
-## Development
-
-### Project Structure
+## Project Structure
 
 ```
 mqtt-bridge/
@@ -189,26 +221,16 @@ mqtt-bridge/
 │   └── mqtt-bridge/        # Main application
 ├── internal/
 │   ├── bridge/            # Bridge implementation
+│   │   ├── breaker.go     # Circuit breaker
+│   │   ├── worker.go      # Worker pool and batching
+│   │   ├── bridge.go      # Core bridge logic
+│   │   ├── types.go       # Common types
+│   │   └── topic_matcher.go # Topic matching logic
 │   ├── config/            # Configuration handling
 │   ├── logger/            # Logging package
 │   └── metrics/           # Metrics collection
 ├── config/                # Configuration files
 ```
-
-### Building
-
-```bash
-# Build binary
-go build -o mqtt-bridge ./cmd/mqtt-bridge
-```
-
-## Contributing
-
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
 
 ## License
 
