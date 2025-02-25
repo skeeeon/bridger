@@ -30,6 +30,11 @@ type Bridge struct {
         dest   bool
         sync.RWMutex
     }
+    ready         struct {
+        workerPool bool
+        dest       bool
+        sync.RWMutex
+    }
     buildVersion string
     buildCommit  string
     buildTime    string
@@ -156,20 +161,24 @@ func NewBridge(cfg *config.Config, log *logger.Logger, metrics *metrics.Metrics,
     return bridge, nil
 }
 
-// Start begins bridging messages between brokers
+// Start begins bridging messages between brokers with improved startup sequence
 func (b *Bridge) Start() error {
-    // Connect to source broker
-    if token := b.sourceConn.Connect(); token.Wait() && token.Error() != nil {
-        return fmt.Errorf("failed to connect to source broker: %w", token.Error())
+    b.logger.Info("starting bridge with controlled startup sequence")
+    
+    // Step 1: Connect to destination broker first
+    if err := b.connectDestination(); err != nil {
+        return fmt.Errorf("failed to connect to destination broker: %w", err)
     }
-
-    // Connect to destination broker
-    if token := b.destConn.Connect(); token.Wait() && token.Error() != nil {
-        return fmt.Errorf("failed to connect to destination broker: %w", token.Error())
+    
+    // Step 2: Start worker pool and wait for ready
+    if err := b.startWorkerPool(); err != nil {
+        return fmt.Errorf("failed to start worker pool: %w", err)
     }
-
-    // Start worker pool
-    b.workerPool.Start()
+    
+    // Step 3: Connect to source and subscribe
+    if err := b.connectSource(); err != nil {
+        return fmt.Errorf("failed to connect to source broker: %w", err)
+    }
 
     b.logger.Info("bridge started successfully",
         "mappings", len(b.topicMapper),
@@ -181,6 +190,78 @@ func (b *Bridge) Start() error {
         "commit", b.buildCommit)
 
     return nil
+}
+
+// Helper method to connect to destination broker
+func (b *Bridge) connectDestination() error {
+    b.logger.Info("connecting to destination broker", "broker", b.cfg.Destination.Broker)
+    
+    if token := b.destConn.Connect(); token.Wait() && token.Error() != nil {
+        return token.Error()
+    }
+
+    // Wait for connection confirmation
+    timeout := time.NewTimer(5 * time.Second)
+    defer timeout.Stop()
+
+    for {
+        select {
+        case <-timeout.C:
+            return fmt.Errorf("timeout waiting for destination connection")
+        default:
+            if b.isDestConnected() {
+                b.logger.Info("destination broker connected and ready")
+                return nil
+            }
+            time.Sleep(100 * time.Millisecond)
+        }
+    }
+}
+
+// Helper method to start worker pool
+func (b *Bridge) startWorkerPool() error {
+    b.logger.Info("starting worker pool", 
+        "workers", b.workerPool.config.NumWorkers,
+        "queueSize", b.workerPool.config.QueueSize)
+    
+    b.workerPool.Start()
+
+    // Set worker pool as ready
+    b.ready.Lock()
+    b.ready.workerPool = true
+    b.ready.Unlock()
+    
+    // Brief delay to ensure worker pool is ready
+    time.Sleep(200 * time.Millisecond)
+    
+    b.logger.Info("worker pool started and ready")
+    return nil
+}
+
+// Helper method to connect to source broker
+func (b *Bridge) connectSource() error {
+    b.logger.Info("connecting to source broker", "broker", b.cfg.Source.Broker)
+    
+    if token := b.sourceConn.Connect(); token.Wait() && token.Error() != nil {
+        return token.Error()
+    }
+
+    // Wait for connection and subscribe to all topics
+    timeout := time.NewTimer(5 * time.Second)
+    defer timeout.Stop()
+
+    for {
+        select {
+        case <-timeout.C:
+            return fmt.Errorf("timeout waiting for source connection")
+        default:
+            if b.isSourceConnected() {
+                b.logger.Info("source broker connected, subscribing to topics")
+                return b.subscribeToTopics()
+            }
+            time.Sleep(100 * time.Millisecond)
+        }
+    }
 }
 
 func (b *Bridge) collectSystemMetrics() {
@@ -205,13 +286,6 @@ func (b *Bridge) handleSourceConnected(_ mqtt.Client) {
     b.isConnected.Unlock()
 
     b.metrics.SetConnectionStatus(true, true)
-
-    if err := b.subscribeToTopics(); err != nil {
-        b.logger.Error("failed to subscribe to topics after connection",
-            "error", err)
-        b.metrics.RecordError()
-        return
-    }
 }
 
 func (b *Bridge) handleDestConnected(_ mqtt.Client) {
@@ -220,6 +294,10 @@ func (b *Bridge) handleDestConnected(_ mqtt.Client) {
     b.isConnected.Lock()
     b.isConnected.dest = true
     b.isConnected.Unlock()
+
+    b.ready.Lock()
+    b.ready.dest = true
+    b.ready.Unlock()
 
     b.metrics.SetConnectionStatus(false, true)
 }
@@ -246,12 +324,18 @@ func (b *Bridge) handleDestConnectionLost(_ mqtt.Client, err error) {
     b.isConnected.dest = false
     b.isConnected.Unlock()
 
+    b.ready.Lock()
+    b.ready.dest = false
+    b.ready.Unlock()
+
     b.metrics.SetConnectionStatus(false, false)
     b.metrics.RecordReconnect(false)
 }
 
 func (b *Bridge) subscribeToTopics() error {
-    for _, mapper := range b.topicMapper {
+    b.logger.Info("subscribing to topics with gradual sequence to handle retained messages")
+    
+    for idx, mapper := range b.topicMapper {
         handler := func(mapper *TopicMatcher) mqtt.MessageHandler {
             return func(client mqtt.Client, msg mqtt.Message) {
                 b.handleMessage(msg.Topic(), msg.Payload(), mapper)
@@ -268,7 +352,18 @@ func (b *Bridge) subscribeToTopics() error {
         b.logger.Info("subscribed to topic",
             "sourceTopic", mapper.SourcePattern,
             "destPattern", mapper.DestinationPattern)
+        
+        // If there are more topics to subscribe to, add a small delay to allow 
+        // processing of any retained messages from the current subscription
+        if idx < len(b.topicMapper)-1 {
+            b.logger.Debug("adding delay between topic subscriptions to process retained messages")
+            time.Sleep(500 * time.Millisecond)
+        }
     }
+    
+    // Allow time for processing any retained messages before proceeding
+    b.logger.Info("waiting for retained messages to be processed")
+    time.Sleep(1 * time.Second)
 
     return nil
 }
@@ -288,6 +383,26 @@ func (b *Bridge) handleMessage(sourceTopic string, payload []byte, mapper *Topic
     }
 }
 
+// Status methods for connection management
+func (b *Bridge) isSourceConnected() bool {
+    b.isConnected.RLock()
+    defer b.isConnected.RUnlock()
+    return b.isConnected.source
+}
+
+func (b *Bridge) isDestConnected() bool {
+    b.isConnected.RLock()
+    defer b.isConnected.RUnlock()
+    return b.isConnected.dest
+}
+
+func (b *Bridge) isWorkerPoolReady() bool {
+    b.ready.RLock()
+    defer b.ready.RUnlock()
+    return b.ready.workerPool
+}
+
+// IsConnected returns connection status for both brokers
 func (b *Bridge) IsConnected() (source, dest bool) {
     b.isConnected.RLock()
     defer b.isConnected.RUnlock()
@@ -297,7 +412,21 @@ func (b *Bridge) IsConnected() (source, dest bool) {
 func (b *Bridge) Stop() {
     b.logger.Info("stopping bridge")
     
-    // Stop worker pool first to process remaining messages
+    // First unsubscribe from all topics to stop new messages
+    for _, mapper := range b.topicMapper {
+        if token := b.sourceConn.Unsubscribe(mapper.SourcePattern); token.Wait() && token.Error() != nil {
+            b.logger.Error("failed to unsubscribe from topic",
+                "topic", mapper.SourcePattern,
+                "error", token.Error())
+        } else {
+            b.logger.Info("unsubscribed from topic", "topic", mapper.SourcePattern)
+        }
+    }
+    
+    // Give time for in-flight messages to arrive
+    time.Sleep(200 * time.Millisecond)
+    
+    // Stop worker pool to process remaining messages
     b.workerPool.Stop()
 
     // Cancel context for metric collection

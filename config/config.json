@@ -27,8 +27,22 @@
             "destination": "forwarded/devices/#"
         }
     ],
+    "performance": {
+        "worker_pool": {
+            "num_workers": 8,        
+            "batch_size": 100,
+            "batch_timeout_ms": 100,
+            "queue_size": 1000
+        },
+        "circuit_breaker": {
+            "max_failures": 5,
+            "timeout_seconds": 60,
+	    "max_requests": 2,
+            "interval_seconds": 60
+        }
+    },
     "log": {
-        "level": "info",
+        "level": "debug",
         "encoding": "json",
         "output_path": "bridge.log"
     },
